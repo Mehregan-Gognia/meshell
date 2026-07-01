@@ -7,6 +7,24 @@
 
 int execute_single_command(char **args)
 {
+    //* EXEC
+    if (strcmp(args[0], "exec") == 0)
+    {
+        if (args[1] == NULL)
+        {
+            exit(0);
+        }
+
+        char **exec_args = &args[1];
+
+        if (execvp(exec_args[0], exec_args) == -1)
+        {
+            perror("exec failed");
+            return 1;
+        }
+    }
+
+    //* CD
     if (strcmp(args[0], "cd") == 0)
     {
         char *target_dir = args[1];
@@ -24,11 +42,13 @@ int execute_single_command(char **args)
         return 0;
     }
 
+    // EXIT
     if (strcmp(args[0], "exit") == 0)
     {
         exit(0);
     }
 
+    //* FORK
     pid_t pid = fork();
     if (pid < 0)
     {
