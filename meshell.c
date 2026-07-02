@@ -12,7 +12,7 @@ int execute_single_command(char **args)
     {
         if (args[1] == NULL)
         {
-            exit(0);
+            return 0;
         }
 
         char **exec_args = &args[1];
@@ -82,6 +82,171 @@ int execute_single_command(char **args)
     }
 
     return 1;
+}
+
+int execute_pipeline(char *line)
+{
+    char *cmds[100];
+    int num_cmds = 0;
+    char *pipe_save_ptr;
+
+    char *token = strtok_r(line, "|", &pipe_save_ptr); // break down to seperate commands
+    while (token != NULL)
+    {
+        if (num_cmds >= 99) // prevent stack overflow
+        {
+            break;
+        }
+
+        cmds[num_cmds++] = token;
+        token = strtok_r(NULL, "|", &pipe_save_ptr);
+    }
+
+    if (num_cmds == 0)
+    {
+        return 0;
+    }
+
+    // allocate pipes
+    int num_pipes = num_cmds - 1;
+    int *pipe_fds = malloc(sizeof(int) * 2 * num_pipes);
+    for (int i = 0; i < num_pipes; i++)
+    {
+        if (pipe(pipe_fds + i * 2) < 0)
+        {
+            perror("pipe failed");
+            free(pipe_fds);
+            return 1;
+        }
+    }
+
+    pid_t *pids = malloc(sizeof(pid_t) * num_cmds);
+
+    for (int i = 0; i < num_cmds; i++)
+    {
+        pids[i] = fork();
+        if (pids[i] < 0)
+        {
+            perror("pipeline fork failed");
+            free(pipe_fds);
+            free(pids);
+            return 1;
+        }
+        else if (pids[i] == 0) // child
+        {
+            // if not the first command, stop stdin from the previous pipe read end
+            if (i > 0)
+            {
+                dup2(pipe_fds[(i - 1) * 2], STDIN_FILENO);
+            }
+            // if not the last command, stop stdout to the current pipe write end
+            if (i < num_cmds - 1)
+            {
+                dup2(pipe_fds[i * 2 + 1], STDOUT_FILENO);
+            }
+
+            //! close all duplicated pipe endpoints in the child
+            for (int j = 0; j < 2 * num_pipes; j++)
+            {
+                close(pipe_fds[j]);
+            }
+
+            // tokenize arguments
+            char *args[100];
+            int argc = 0;
+            char *arg_save_ptr;
+            char *arg_token = strtok_r(cmds[i], " \t\r\n", &arg_save_ptr);
+            while (arg_token != NULL)
+            {
+                if (num_cmds >= 99) // prevent stack overflow
+                {
+                    break;
+                }
+
+                args[argc++] = arg_token;
+                arg_token = strtok_r(NULL, " \t\r\n", &arg_save_ptr);
+            }
+            args[argc] = NULL;
+
+            if (args[0] != NULL)
+            {
+                // process commands inside the pipeline subshell sandbox
+                if (strcmp(args[0], "cd") == 0)
+                {
+                    char *target_dir = args[1];
+
+                    if (target_dir == NULL)
+                    {
+                        target_dir = getenv("HOME");
+                    }
+
+                    if (chdir(target_dir) != 0)
+                    {
+                        perror("cd failed");
+                    }
+
+                    exit(0);
+                }
+
+                if (strcmp(args[0], "exit") == 0)
+                {
+                    int exit_code = 0;
+                    if (args[1] != NULL)
+                    {
+                        exit_code = atoi(args[1]);
+                    }
+
+                    exit(exit_code);
+                }
+
+                if (strcmp(args[0], "exec") == 0)
+                {
+                    if (args[1] == NULL)
+                    {
+                        exit(0);
+                    }
+
+                    execvp(args[1], &args[1]);
+                    perror("exec failed");
+                    exit(1);
+                }
+
+                execvp(args[0], args);
+                perror("execvp failed");
+            }
+            exit(127);
+        }
+    }
+
+    // parent
+    // close parent-side pipes so EOF signals is returned from children
+    for (int j = 0; j < 2 * num_pipes; j++)
+    {
+        close(pipe_fds[j]);
+    }
+
+    // wait for all children to complete and save the exit code of the last command
+    int last_exit_code = 0;
+    for (int i = 0; i < num_cmds; i++)
+    {
+        int status;
+        waitpid(pids[i], &status, 0);
+        if (i == num_cmds - 1)
+        {
+            if (WIFEXITED(status))
+            {
+                last_exit_code = WEXITSTATUS(status);
+            }
+            else
+            {
+                last_exit_code = 1;
+            }
+        }
+    }
+
+    free(pipe_fds);
+    free(pids);
+    return last_exit_code;
 }
 
 int execute_command_line(char *line)
@@ -228,6 +393,7 @@ int execute_command_line(char *line)
                     }
                 }
             }
+
             continue;
         }
 
@@ -240,32 +406,53 @@ int execute_command_line(char *line)
         }
 
         char saved_char = *end;
-        *end = '\0'; // isolate the command chunk
+        *end = '\0'; // isolate the command or pipeline
 
         if (should_execute)
         {
-            char *args[100];
-            int i = 0;
-            char *arg_save_ptr;
-            char *token = strtok_r(ptr, " \t\r\n", &arg_save_ptr);
-            while (token != NULL)
+            // scan the command for a pipe before splitting arguments
+            if (strchr(ptr, '|') != NULL)
             {
-                args[i++] = token;
-                token = strtok_r(NULL, " \t\r\n", &arg_save_ptr);
-            }
-            args[i] = NULL;
-
-            if (args[0] != NULL)
-            {
-                int exec_result = execute_single_command(args);
-
+                int pipe_res = execute_pipeline(ptr);
                 if (negate)
                 {
-                    last_exit_code = (exec_result == 0) ? 1 : 0;
+                    last_exit_code = !pipe_res;
                 }
                 else
                 {
-                    last_exit_code = exec_result;
+                    last_exit_code = pipe_res;
+                }
+            }
+            else
+            {
+                // standard single command execution
+                char *args[100];
+                int i = 0;
+                char *arg_save_ptr;
+                char *token = strtok_r(ptr, " \t\r\n", &arg_save_ptr);
+                while (token != NULL)
+                {
+                    if (i >= 99)
+                    {
+                        break; // Hard bounds check
+                    }
+                    args[i++] = token;
+                    token = strtok_r(NULL, " \t\r\n", &arg_save_ptr);
+                }
+                args[i] = NULL;
+
+                if (args[0] != NULL)
+                {
+                    int exec_result = execute_single_command(args);
+
+                    if (negate)
+                    {
+                        last_exit_code = !exec_result;
+                    }
+                    else
+                    {
+                        last_exit_code = exec_result;
+                    }
                 }
             }
         }
@@ -344,6 +531,7 @@ int main()
             {
                 free(complete_line);
             }
+
             break;
         }
 
@@ -354,6 +542,7 @@ int main()
             free(complete_line);
         }
     }
+
     free(buffer);
     return 0;
 }
