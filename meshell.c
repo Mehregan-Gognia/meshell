@@ -6,7 +6,8 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 
-// redirection operators: <, >, >>, 2>, 2>>
+// redirection operators: <, >, >>, 2>, 2>>, <>, 1<>, <&, >&
+// dynamically extracts file descriptor prefixes and handles descriptor closure <&- / duplication 2>&1
 // returns 0 on success, -1 on failure
 int check_and_handle_redirections(char **args)
 {
@@ -17,6 +18,7 @@ int check_and_handle_redirections(char **args)
         int fd_to_replace = -1;
         int flags = 0;
         int is_input = 0;
+        int is_dup_closed = 0;
         char *operator_ptr = token;
         int explicit_fd = -1;
 
@@ -58,6 +60,32 @@ int check_and_handle_redirections(char **args)
             else
             {
                 fd_to_replace = STDIN_FILENO;
+            }
+        }
+        else if (strncmp(operator_ptr, "<&", 2) == 0) // input file descriptor duplication/closure
+        {
+            operator_len = 2;
+            is_dup_closed = 1;
+            if (explicit_fd != -1)
+            {
+                fd_to_replace = explicit_fd;
+            }
+            else
+            {
+                fd_to_replace = STDIN_FILENO;
+            }
+        }
+        else if (strncmp(operator_ptr, ">&", 2) == 0) // output file descriptor duplication/closure
+        {
+            operator_len = 2;
+            is_dup_closed = 1;
+            if (explicit_fd != -1)
+            {
+                fd_to_replace = explicit_fd;
+            }
+            else
+            {
+                fd_to_replace = STDOUT_FILENO;
             }
         }
         else if (operator_ptr[0] == '>')
@@ -112,27 +140,45 @@ int check_and_handle_redirections(char **args)
                 return -1;
             }
 
-            int fd;
-            if (is_input)
+            if (is_dup_closed)
             {
-                fd = open(filename, flags);
+                if (strcmp(filename, "-") == 0)
+                {
+                    close(fd_to_replace);
+                }
+                else
+                {
+                    int from_fd = atoi(filename);
+                    if (from_fd != fd_to_replace)
+                    {
+                        dup2(from_fd, fd_to_replace);
+                    }
+                }
             }
             else
             {
-                fd = open(filename, flags, 0644);
-            }
+                int fd;
+                if (is_input)
+                {
+                    fd = open(filename, flags);
+                }
+                else
+                {
+                    fd = open(filename, flags, 0644);
+                }
 
-            if (fd < 0)
-            {
-                perror("open redirection file failed");
-                return -1;
-            }
+                if (fd < 0)
+                {
+                    perror("open redirection file failed");
+                    return -1;
+                }
 
-            // duplicate the file descriptor into our target slot
-            if (fd != fd_to_replace)
-            {
-                dup2(fd, fd_to_replace);
-                close(fd);
+                // duplicate the file descriptor into our target slot
+                if (fd != fd_to_replace)
+                {
+                    dup2(fd, fd_to_replace);
+                    close(fd);
+                }
             }
 
             // shift argument vector left to completely erase the redirection tokens
