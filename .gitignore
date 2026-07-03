@@ -1,3 +1,8 @@
 meshell
 foo
 bar
+main.o
+executor.o
+parser.o
+substitution.o
+redirection.o
