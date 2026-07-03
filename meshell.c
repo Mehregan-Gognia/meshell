@@ -112,7 +112,16 @@ int check_and_handle_redirections(char **args)
                 return -1;
             }
 
-            int fd = is_input ? open(filename, flags) : open(filename, flags, 0644);
+            int fd;
+            if (is_input)
+            {
+                fd = open(filename, flags);
+            }
+            else
+            {
+                fd = open(filename, flags, 0644);
+            }
+
             if (fd < 0)
             {
                 perror("open redirection file failed");
@@ -120,8 +129,11 @@ int check_and_handle_redirections(char **args)
             }
 
             // duplicate the file descriptor into our target slot
-            dup2(fd, fd_to_replace);
-            close(fd);
+            if (fd != fd_to_replace)
+            {
+                dup2(fd, fd_to_replace);
+                close(fd);
+            }
 
             // shift argument vector left to completely erase the redirection tokens
             int j = i;
@@ -300,7 +312,7 @@ int execute_pipeline(char *line)
             char *arg_token = strtok_r(cmds[i], " \t\r\n", &arg_save_ptr);
             while (arg_token != NULL)
             {
-                if (num_cmds >= 99) // prevent stack overflow
+                if (argc >= 99) // prevent stack overflow
                 {
                     break;
                 }
