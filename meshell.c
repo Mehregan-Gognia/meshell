@@ -6,6 +6,13 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 
+int check_and_handle_redirections(char **args);
+int execute_single_command(char **args);
+int execute_pipeline(char *line);
+char *capture_command_output(char *cmd);
+char *expand_all_substitutions(char *src);
+int execute_command_line(char *line);
+
 // redirection operators: <, >, >>, 2>, 2>>, <>, 1<>, <&, >&
 // dynamically extracts file descriptor prefixes and handles descriptor closure <&- / duplication 2>&1
 // returns 0 on success, -1 on failure
@@ -456,6 +463,172 @@ int execute_pipeline(char *line)
     return last_exit_code;
 }
 
+char *capture_command_output(char *cmd)
+{
+    int pipefds[2];
+    if (pipe(pipefds) < 0)
+    {
+        perror("substitution pipe failed");
+        return strdup("");
+    }
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("substitution fork failed");
+        close(pipefds[0]);
+        close(pipefds[1]);
+        return strdup("");
+    }
+
+    if (pid == 0)
+    {
+        // child: stdout to the write end
+        dup2(pipefds[1], STDOUT_FILENO);
+        close(pipefds[0]);
+        close(pipefds[1]);
+
+        // evaluate inner shell command
+        int ret = execute_command_line(cmd);
+        exit(ret);
+    }
+
+    // parent
+    close(pipefds[1]);
+
+    size_t cap = 4096;
+    size_t len = 0;
+    char *output = malloc(cap);
+    output[0] = '\0';
+
+    char read_buf[256];
+    ssize_t bytes_read;
+    while ((bytes_read = read(pipefds[0], read_buf, sizeof(read_buf))) > 0)
+    {
+        if (len + bytes_read >= cap)
+        {
+            cap *= 2;
+            output = realloc(output, cap);
+        }
+        memcpy(output + len, read_buf, bytes_read);
+        len += bytes_read;
+        output[len] = '\0';
+    }
+    close(pipefds[0]);
+    waitpid(pid, NULL, 0);
+
+    // strip trailing newlines returns
+    while (len > 0 && (output[len - 1] == '\n' || output[len - 1] == '\r'))
+    {
+        output[len - 1] = '\0';
+        len--;
+    }
+
+    return output;
+}
+
+// parsing a string left to right, processing any $(...) blocks
+char *expand_all_substitutions(char *src)
+{
+    char *ptr = src;
+    char *start = strstr(ptr, "$(");
+    if (start == NULL)
+    {
+        return strdup(src);
+    }
+
+    size_t result_cap = strlen(src) + 512;
+    char *result = malloc(result_cap);
+    result[0] = '\0';
+    size_t result_len = 0;
+
+    while (start != NULL)
+    {
+        // append everything to the $(
+        size_t prefix_len = start - ptr;
+        if (result_len + prefix_len >= result_cap)
+        {
+            result_cap += prefix_len + 512;
+            result = realloc(result, result_cap);
+        }
+
+        strncat(result, ptr, prefix_len);
+        result_len += prefix_len;
+
+        // scan to find closing parenthesis
+        char *sub_ptr = start + 2;
+        int depth = 1;
+        while (*sub_ptr != '\0' && depth > 0)
+        {
+            if (strncmp(sub_ptr, "$(", 2) == 0)
+            {
+                depth++;
+                sub_ptr += 2;
+            }
+            else if (*sub_ptr == ')')
+            {
+                depth--;
+                if (depth > 0)
+                    sub_ptr++;
+            }
+            else
+            {
+                sub_ptr++;
+            }
+        }
+
+        if (*sub_ptr == ')')
+        {
+            *sub_ptr = '\0'; // isolate inner command
+            char *inner_cmd = start + 2;
+
+            // recursively expand any nested substitutions inside the inner command block first
+            char *expanded_inner = expand_all_substitutions(inner_cmd);
+            char *output = capture_command_output(expanded_inner);
+            free(expanded_inner);
+
+            // splice the captured stdout into result builder
+            size_t output_len = strlen(output);
+            if (result_len + output_len >= result_cap)
+            {
+                result_cap += output_len + 512;
+                result = realloc(result, result_cap);
+            }
+
+            strcat(result, output);
+            result_len += output_len;
+            free(output);
+
+            ptr = sub_ptr + 1; // advance past the closing ')'
+        }
+        else
+        {
+            // fallback for unmatched expressions
+            if (result_len + 2 >= result_cap)
+            {
+                result_cap += 512;
+                result = realloc(result, result_cap);
+            }
+
+            strcat(result, "$(");
+            result_len += 2;
+            ptr = start + 2;
+        }
+
+        start = strstr(ptr, "$(");
+    }
+
+    size_t rest_len = strlen(ptr);
+    if (result_len + rest_len >= result_cap)
+    {
+        result_cap += rest_len + 1;
+        result = realloc(result, result_cap);
+    }
+    strcat(result, ptr);
+
+    return result;
+}
+
 int execute_command_line(char *line)
 {
     char *ptr = line;
@@ -609,6 +782,32 @@ int execute_command_line(char *line)
         char *end = ptr;
         while (*end != '\0' && *end != ';' && strncmp(end, "&&", 2) != 0 && strncmp(end, "||", 2) != 0 && *end != '(')
         {
+            // skip the contents of $(...) completely
+            if (strncmp(end, "$(", 2) == 0)
+            {
+                end += 2;
+                int depth = 1;
+                while (*end != '\0' && depth > 0)
+                {
+                    if (strncmp(end, "$(", 2) == 0)
+                    {
+                        depth++;
+                        end += 2;
+                    }
+                    else if (*end == ')')
+                    {
+                        depth--;
+                        end++;
+                    }
+                    else
+                    {
+                        end++;
+                    }
+                }
+
+                continue; // resume scanning past the matching execution boundary
+            }
+
             end++;
         }
 
@@ -617,17 +816,20 @@ int execute_command_line(char *line)
 
         if (should_execute)
         {
+            // transform any inner command substitutions before splitting arguments
+            char *expanded_ptr = expand_all_substitutions(ptr);
+
             // scan the command for a pipe before splitting arguments
-            if (strchr(ptr, '|') != NULL)
+            if (strchr(expanded_ptr, '|') != NULL)
             {
-                int pipe_res = execute_pipeline(ptr);
+                int pipe_result = execute_pipeline(expanded_ptr);
                 if (negate)
                 {
-                    last_exit_code = !pipe_res;
+                    last_exit_code = !pipe_result;
                 }
                 else
                 {
-                    last_exit_code = pipe_res;
+                    last_exit_code = pipe_result;
                 }
             }
             else
@@ -641,7 +843,7 @@ int execute_command_line(char *line)
                 {
                     if (i >= 99)
                     {
-                        break; // Hard bounds check
+                        break; // hard bounds check
                     }
                     args[i++] = token;
                     token = strtok_r(NULL, " \t\r\n", &arg_save_ptr);
@@ -662,11 +864,14 @@ int execute_command_line(char *line)
                     }
                 }
             }
+
+            free(expanded_ptr);
         }
 
         *end = saved_char;
         ptr = end; // move pointer forward
     }
+
     return last_exit_code;
 }
 
