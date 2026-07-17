@@ -259,7 +259,7 @@ int execute_command_line(char *line)
             else
             {
                 // standard single command execution
-                char *args[100];
+                char *args[MAX_ARGS];
                 int i = 0;
                 char *arg_save_ptr;
 
@@ -267,7 +267,7 @@ int execute_command_line(char *line)
                 char *token = strtok_r(expanded_ptr, " \t\r\n", &arg_save_ptr);
                 while (token != NULL)
                 {
-                    if (i >= 99)
+                    if (i >= MAX_ARGS - 1) // prevent stack overflow
                     {
                         break; // hard bounds check
                     }

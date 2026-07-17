@@ -142,6 +142,23 @@ int check_and_handle_redirections(char **args)
                 }
                 else
                 {
+                    // Validate that the filename is actually a digit before parsing
+                    int is_digit = 1;
+                    for (int k = 0; filename[k] != '\0'; k++)
+                    {
+                        if (filename[k] < '0' || filename[k] > '9')
+                        {
+                            is_digit = 0;
+                            break;
+                        }
+                    }
+
+                    if (is_digit == 0)
+                    {
+                        fprintf(stderr, "redirection syntax error: expected file descriptor\n");
+                        return -1;
+                    }
+
                     int from_fd = atoi(filename);
                     if (from_fd != fd_to_replace)
                     {
@@ -152,7 +169,7 @@ int check_and_handle_redirections(char **args)
             else
             {
                 int fd;
-                if (is_input)
+                if (is_input == 1)
                 {
                     fd = open(filename, flags);
                 }

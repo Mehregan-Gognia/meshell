@@ -184,14 +184,14 @@ int execute_single_command(char **args)
 // executes a pipeline of commands separated by the pipe operator '|'
 int execute_pipeline(char *line)
 {
-    char *cmds[100];
+    char *cmds[MAX_CMDS];
     int num_cmds = 0;
     char *pipe_save_ptr;
 
     char *token = strtok_r(line, "|", &pipe_save_ptr); // break down to separate commands
     while (token != NULL)
     {
-        if (num_cmds >= 99) // prevent stack overflow
+        if (num_cmds >= MAX_CMDS - 1) // prevent stack overflow
         {
             break;
         }
@@ -227,6 +227,11 @@ int execute_pipeline(char *line)
         if (pids[i] < 0)
         {
             perror("pipeline fork failed");
+            for (int k = 0; k < i; k++)
+            {
+                kill(pids[k], SIGKILL);
+                waitpid(pids[k], NULL, 0);
+            }
             free(pipe_fds);
             free(pids);
             return 1;
@@ -268,13 +273,13 @@ int execute_pipeline(char *line)
             }
 
             // tokenize arguments
-            char *args[100];
+            char *args[MAX_ARGS];
             int argc = 0;
             char *arg_save_ptr;
             char *arg_token = strtok_r(cmds[i], " \t\r\n", &arg_save_ptr);
             while (arg_token != NULL)
             {
-                if (argc >= 99) // prevent stack overflow
+                if (argc >= MAX_ARGS - 1) // prevent stack overflow
                 {
                     break;
                 }
