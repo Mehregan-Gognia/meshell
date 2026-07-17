@@ -1,5 +1,5 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -g
+CFLAGS  = -Wall -Wextra -g -O2
 TARGET  = meshell
 SRCS    = main.c parser.c executor.c substitution.c redirection.c
 OBJS    = $(SRCS:.c=.o)

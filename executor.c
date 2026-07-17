@@ -1,8 +1,54 @@
 #include "shell.h"
 
+int next_job_bg = 0; // Added: Global background state definition
+
 // executes a single command with arguments, handling built in commands and forking for external commands
 int execute_single_command(char **args)
 {
+    //* FG
+    if (strcmp(args[0], "fg") == 0)
+    {
+        if (last_job_pid <= 0)
+        {
+            fprintf(stderr, "fg: no current job\n");
+            return 1;
+        }
+        if (isatty(STDIN_FILENO))
+        {
+            tcsetpgrp(STDIN_FILENO, last_job_pid);
+        }
+
+        kill(-last_job_pid, SIGCONT); // Resume process group
+
+        int status;
+        waitpid(last_job_pid, &status, WUNTRACED);
+
+        if (isatty(STDIN_FILENO))
+        {
+            tcsetpgrp(STDIN_FILENO, getpgrp()); // Reclaim terminal
+        }
+
+        if (WIFSTOPPED(status))
+            return 128 + WSTOPSIG(status);
+        if (WIFSIGNALED(status))
+            return 128 + WTERMSIG(status);
+        if (WIFEXITED(status))
+            return WEXITSTATUS(status);
+        return 0;
+    }
+
+    //* BG
+    if (strcmp(args[0], "bg") == 0)
+    {
+        if (last_job_pid <= 0)
+        {
+            fprintf(stderr, "bg: no current job\n");
+            return 1;
+        }
+        kill(-last_job_pid, SIGCONT); // Resume process group in background
+        return 0;
+    }
+
     //* EXEC
     if (strcmp(args[0], "exec") == 0)
     {
@@ -59,6 +105,23 @@ int execute_single_command(char **args)
     }
     else if (pid == 0)
     {
+        // child
+        if (isatty(STDIN_FILENO))
+        {
+            setpgid(0, 0);
+            if (!next_job_bg) //! Only claim terminal foreground if NOT a background job
+            {
+                tcsetpgrp(STDIN_FILENO, getpid());
+            }
+        }
+
+        // Safe to reset signal actions back to defaults now
+        signal(SIGINT, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGTSTP, SIG_DFL);
+        signal(SIGTTIN, SIG_DFL);
+        signal(SIGTTOU, SIG_DFL);
+
         // handle file redirections inside the child
         if (check_and_handle_redirections(args) < 0)
         {
@@ -73,10 +136,42 @@ int execute_single_command(char **args)
     }
     else
     {
-        int status;
-        waitpid(pid, &status, 0);
+        // parent
+        if (isatty(STDIN_FILENO))
+        {
+            setpgid(pid, pid);
+            if (!next_job_bg) // FIXED: Only claim terminal foreground if NOT a background job!
+            {
+                tcsetpgrp(STDIN_FILENO, pid);
+            }
+        }
 
-        // extract the exit code of the child process
+        // Return instantly to the prompt for background jobs
+        if (next_job_bg)
+        {
+            last_job_pid = pid; // Track background pid for fg command mapping
+            return 0;
+        }
+
+        int status;
+        waitpid(pid, &status, WUNTRACED);
+
+        if (isatty(STDIN_FILENO))
+        {
+            tcsetpgrp(STDIN_FILENO, getpgrp()); // Instantly reclaim terminal
+        }
+
+        if (WIFSTOPPED(status))
+        {
+            last_job_pid = pid; // Track job mapping for fg/bg routines
+            return 128 + WSTOPSIG(status);
+        }
+
+        if (WIFSIGNALED(status))
+        {
+            return 128 + WTERMSIG(status);
+        }
+
         if (WIFEXITED(status))
         {
             return WEXITSTATUS(status);
@@ -93,7 +188,7 @@ int execute_pipeline(char *line)
     int num_cmds = 0;
     char *pipe_save_ptr;
 
-    char *token = strtok_r(line, "|", &pipe_save_ptr); // break down to seperate commands
+    char *token = strtok_r(line, "|", &pipe_save_ptr); // break down to separate commands
     while (token != NULL)
     {
         if (num_cmds >= 99) // prevent stack overflow
@@ -124,6 +219,7 @@ int execute_pipeline(char *line)
     }
 
     pid_t *pids = malloc(sizeof(pid_t) * num_cmds);
+    pid_t pgid = 0;
 
     for (int i = 0; i < num_cmds; i++)
     {
@@ -135,8 +231,25 @@ int execute_pipeline(char *line)
             free(pids);
             return 1;
         }
-        else if (pids[i] == 0) // child
+        else if (pids[i] == 0)
         {
+            // child process group setup
+            if (isatty(STDIN_FILENO))
+            {
+                pid_t my_pgid = (pgid == 0) ? getpid() : pgid;
+                setpgid(0, my_pgid);
+                if (!next_job_bg) // Only claim terminal foreground if NOT background!
+                {
+                    tcsetpgrp(STDIN_FILENO, my_pgid);
+                }
+            }
+
+            signal(SIGINT, SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
+            signal(SIGTTIN, SIG_DFL);
+            signal(SIGTTOU, SIG_DFL);
+
             // if not the first command, stop stdin from the previous pipe read end
             if (i > 0)
             {
@@ -237,13 +350,39 @@ int execute_pipeline(char *line)
 
             exit(127);
         }
+        else
+        {
+            // Parent side loop sync: secure child group membership instantly before race wins
+            if (pgid == 0)
+            {
+                pgid = pids[0];
+            }
+            if (isatty(STDIN_FILENO))
+            {
+                setpgid(pids[i], pgid);
+            }
+        }
     }
 
-    // parent
+    // Hand off foreground terminal focus to the running pipeline group
+    if (isatty(STDIN_FILENO) && !next_job_bg) // Guard against background lines
+    {
+        tcsetpgrp(STDIN_FILENO, pgid);
+    }
+
     // close parent-side pipes so EOF signals is returned from children
     for (int j = 0; j < 2 * num_pipes; j++)
     {
         close(pipe_fds[j]);
+    }
+
+    // Return instantly for background pipelines without blocking
+    if (next_job_bg)
+    {
+        last_job_pid = pgid;
+        free(pipe_fds);
+        free(pids);
+        return 0;
     }
 
     // wait for all children to complete and save the exit code of the last command
@@ -251,18 +390,34 @@ int execute_pipeline(char *line)
     for (int i = 0; i < num_cmds; i++)
     {
         int status;
-        waitpid(pids[i], &status, 0);
+        waitpid(pids[i], &status, WUNTRACED);
+
         if (i == num_cmds - 1)
         {
             if (WIFEXITED(status))
             {
                 last_exit_code = WEXITSTATUS(status);
             }
+            else if (WIFSIGNALED(status))
+            {
+                last_exit_code = 128 + WTERMSIG(status);
+            }
+            else if (WIFSTOPPED(status))
+            {
+                last_job_pid = pgid; // FIXED: Safely tracks pipeline group for fg/bg routines!
+                last_exit_code = 128 + WSTOPSIG(status);
+            }
             else
             {
                 last_exit_code = 1;
             }
         }
+    }
+
+    // Safely reclaim foreground terminal control back to the shell prompt
+    if (isatty(STDIN_FILENO))
+    {
+        tcsetpgrp(STDIN_FILENO, getpgrp());
     }
 
     free(pipe_fds);

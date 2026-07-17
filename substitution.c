@@ -21,7 +21,11 @@ char *capture_command_output(char *cmd)
 
     if (pid == 0)
     {
-        // child: stdout to the write end
+        // child
+        // disable job control so background evaluation doesn't hijack foreground focus
+        job_control_enabled = 0;
+
+        // stdout to the write end
         dup2(pipefds[1], STDOUT_FILENO);
         close(pipefds[0]);
         close(pipefds[1]);

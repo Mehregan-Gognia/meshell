@@ -7,8 +7,33 @@ char *capture_command_output(char *cmd);
 char *expand_all_substitutions(char *src);
 int execute_command_line(char *line);
 
+int job_control_enabled = 0;
+pid_t last_job_pid = 0;
+
 int main()
 {
+    int shell_terminal = STDIN_FILENO;
+    if (isatty(shell_terminal))
+    {
+        // Loop until the shell is in the foreground group
+        while (tcgetpgrp(shell_terminal) != getpgrp())
+        {
+            kill(-getpgrp(), SIGTTIN);
+        }
+
+        // Ignore interactive job control signals in the parent shell
+        signal(SIGINT, SIG_IGN);
+        signal(SIGQUIT, SIG_IGN);
+        signal(SIGTSTP, SIG_IGN);
+        signal(SIGTTIN, SIG_IGN);
+        signal(SIGTTOU, SIG_IGN);
+
+        // Secure the shell inside its own process group
+        pid_t shell_pgid = getpid();
+        setpgid(shell_pgid, shell_pgid);
+        tcsetpgrp(shell_terminal, shell_pgid);
+    }
+
     char *buffer = NULL;
     size_t buffer_size = 0;
     ssize_t characters_read;
