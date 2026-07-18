@@ -24,7 +24,6 @@ int execute_command_line(char *line)
         if (*ptr == ';')
         {
             condition = 0;
-            last_exit_code = 0; // reset for next commands
             ptr++;
             continue;
         }
@@ -33,7 +32,6 @@ int execute_command_line(char *line)
         if (*ptr == '&' && *(ptr + 1) != '&')
         {
             condition = 0; // Next command runs unconditionally
-            last_exit_code = 0;
             ptr++;
             continue;
         }
@@ -144,7 +142,7 @@ int execute_command_line(char *line)
                 }
                 else
                 {
-                    // FIXED: Parent-side subshell Job Control synchronization
+                    // Parent-side subshell Job Control synchronization
                     if (isatty(STDIN_FILENO))
                     {
                         setpgid(subshell_pid, subshell_pid);
@@ -154,7 +152,7 @@ int execute_command_line(char *line)
                     int status;
                     waitpid(subshell_pid, &status, WUNTRACED);
 
-                    // FIXED: Instantly reclaim foreground terminal focus
+                    // Instantly reclaim foreground terminal focus
                     if (isatty(STDIN_FILENO))
                     {
                         tcsetpgrp(STDIN_FILENO, getpgrp());
@@ -240,14 +238,18 @@ int execute_command_line(char *line)
         {
             next_job_bg = is_background; // Set the global background routing flag
 
-            // transform any inner command substitutions before splitting arguments
-            char *expanded_ptr = expand_all_substitutions(ptr);
+            // Transform any inner command substitutions first
+            char *sub_expanded = expand_all_substitutions(ptr);
+
+            // Chain the environment variable expansion pass right after it
+            char *expanded_ptr = expand_environment_variables(sub_expanded, last_exit_code);
+            free(sub_expanded); // Clean up the intermediate buffer
 
             // scan the command for a pipe before splitting arguments
             if (strchr(expanded_ptr, '|') != NULL)
             {
                 int pipe_result = execute_pipeline(expanded_ptr);
-                if (negate)
+                if (negate == 1)
                 {
                     last_exit_code = !pipe_result;
                 }
@@ -258,29 +260,219 @@ int execute_command_line(char *line)
             }
             else
             {
-                // standard single command execution
+                // standard single command execution with POSIX backslash/quote parsing
                 char *args[MAX_ARGS];
                 int i = 0;
-                char *arg_save_ptr;
+                char *arg_ptr = expanded_ptr;
 
-                // Changed 'ptr' to 'expanded_ptr' to capture command substitution args!
-                char *token = strtok_r(expanded_ptr, " \t\r\n", &arg_save_ptr);
-                while (token != NULL)
+                while (*arg_ptr != '\0')
                 {
-                    if (i >= MAX_ARGS - 1) // prevent stack overflow
+                    // Skip whitespace delimiters
+                    while (*arg_ptr == ' ' || *arg_ptr == '\t' || *arg_ptr == '\r' || *arg_ptr == '\n')
                     {
-                        break; // hard bounds check
+                        arg_ptr++;
                     }
-                    args[i++] = token;
-                    token = strtok_r(NULL, " \t\r\n", &arg_save_ptr);
+
+                    if (*arg_ptr == '\0')
+                    {
+                        break;
+                    }
+
+                    if (i >= MAX_ARGS - 1)
+                    {
+                        break;
+                    }
+
+                    // Allocate a buffer to build the quote-stripped argument
+                    char *arg = malloc(strlen(arg_ptr) + 1);
+                    int arg_len = 0;
+                    int in_double_quote = 0;
+                    int in_single_quote = 0;
+                    int can_expand_tilde = 1; // FIXED: Active only at the absolute start of a token
+
+                    while (*arg_ptr != '\0')
+                    {
+                        // Handle Tilde Expansion safely outside quotes at token start
+                        if (can_expand_tilde && *arg_ptr == '~')
+                        {
+                            can_expand_tilde = 0;
+                            char *curr = arg_ptr + 1;
+                            while (*curr != '\0' && *curr != '/' && *curr != ' ' && *curr != '\t' && *curr != '\r' && *curr != '\n')
+                            {
+                                curr++;
+                            }
+                            size_t prefix_len = curr - arg_ptr;
+                            if (prefix_len == 1) // Standalone "~" or "~/"
+                            {
+                                char *home = getenv("HOME");
+                                if (home != NULL)
+                                {
+                                    strcpy(arg + arg_len, home);
+                                    arg_len += strlen(home);
+                                    arg_ptr++;
+                                    continue;
+                                }
+                            }
+                            else // "~username"
+                            {
+                                char user[256];
+                                size_t u_len = prefix_len - 1;
+                                if (u_len > 255)
+                                {
+                                    u_len = 255;
+                                }
+
+                                strncpy(user, arg_ptr + 1, u_len);
+                                user[u_len] = '\0';
+
+                                struct passwd *pw = getpwnam(user);
+                                if (pw != NULL && pw->pw_dir != NULL)
+                                {
+                                    strcpy(arg + arg_len, pw->pw_dir);
+                                    arg_len += strlen(pw->pw_dir);
+                                    arg_ptr += prefix_len;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Revoke tilde privilege as soon as any word character flows through
+                        can_expand_tilde = 0;
+
+                        if (in_single_quote)
+                        {
+                            if (*arg_ptr == '\'')
+                            {
+                                in_single_quote = 0;
+                                arg_ptr++;
+                            }
+                            else
+                            {
+                                // FIXED: Mask wildcards inside single quotes
+                                if (*arg_ptr == '*')
+                                    arg[arg_len++] = '\x01';
+                                else if (*arg_ptr == '?')
+                                    arg[arg_len++] = '\x02';
+                                else
+                                    arg[arg_len++] = *arg_ptr;
+                                arg_ptr++;
+                            }
+                        }
+                        else if (in_double_quote)
+                        {
+                            if (*arg_ptr == '"')
+                            {
+                                in_double_quote = 0;
+                                arg_ptr++;
+                            }
+                            else if (*arg_ptr == '\\')
+                            {
+                                char next = *(arg_ptr + 1);
+                                if (next == '"' || next == '$' || next == '\\' || next == '`' || next == '\n')
+                                {
+                                    if (next != '\0')
+                                    {
+                                        if (next == '*')
+                                        {
+                                            arg[arg_len++] = '\x01';
+                                        }
+                                        else if (next == '?')
+                                        {
+                                            arg[arg_len++] = '\x02';
+                                        }
+                                        else
+                                        {
+                                            arg[arg_len++] = next;
+                                        }
+                                        arg_ptr += 2;
+                                    }
+                                    else
+                                    {
+                                        arg[arg_len++] = '\\';
+                                        arg_ptr++;
+                                    }
+                                }
+                                else
+                                {
+                                    arg[arg_len++] = '\\';
+                                    arg_ptr++;
+                                }
+                            }
+                            else
+                            {
+                                // FIXED: Mask wildcards inside double quotes
+                                if (*arg_ptr == '*')
+                                {
+                                    arg[arg_len++] = '\x01';
+                                }
+                                else if (*arg_ptr == '?')
+                                {
+                                    arg[arg_len++] = '\x02';
+                                }
+                                else
+                                {
+                                    arg[arg_len++] = *arg_ptr;
+                                }
+                                arg_ptr++;
+                            }
+                        }
+                        else
+                        {
+                            // Outside of any quotes
+                            if (*arg_ptr == '\\')
+                            {
+                                arg_ptr++; // Skip the backslash literal
+                                if (*arg_ptr != '\0')
+                                {
+                                    // FIXED: Mask backslash-escaped wildcards
+                                    if (*arg_ptr == '*')
+                                    {
+                                        arg[arg_len++] = '\x01';
+                                    }
+                                    else if (*arg_ptr == '?')
+                                    {
+                                        arg[arg_len++] = '\x02';
+                                    }
+                                    else
+                                    {
+                                        arg[arg_len++] = *arg_ptr;
+                                    }
+                                    arg_ptr++;
+                                }
+                            }
+                            else if (*arg_ptr == '\'')
+                            {
+                                in_single_quote = 1;
+                                arg_ptr++;
+                            }
+                            else if (*arg_ptr == '"')
+                            {
+                                in_double_quote = 1;
+                                arg_ptr++;
+                            }
+                            else if (*arg_ptr == ' ' || *arg_ptr == '\t' || *arg_ptr == '\r' || *arg_ptr == '\n')
+                            {
+                                break; // Unquoted/unescaped whitespace means token end
+                            }
+                            else
+                            {
+                                arg[arg_len++] = *arg_ptr;
+                                arg_ptr++;
+                            }
+                        }
+                    }
+                    arg[arg_len] = '\0';
+                    args[i++] = arg;
                 }
                 args[i] = NULL;
 
                 if (args[0] != NULL)
                 {
-                    int exec_result = execute_single_command(args);
+                    char **globbed_args = apply_globbing(args);
 
-                    if (negate)
+                    int exec_result = execute_single_command(globbed_args);
+
+                    if (negate == 1)
                     {
                         last_exit_code = !exec_result;
                     }
@@ -288,6 +480,19 @@ int execute_command_line(char *line)
                     {
                         last_exit_code = exec_result;
                     }
+
+                    for (int k = 0; globbed_args[k] != NULL; k++)
+                    {
+                        free(globbed_args[k]);
+                    }
+
+                    free(globbed_args);
+                }
+
+                // Clean up dynamically allocated argument strings
+                for (int k = 0; k < i; k++)
+                {
+                    free(args[k]);
                 }
             }
 
@@ -299,5 +504,6 @@ int execute_command_line(char *line)
         ptr = end; // move pointer forward
     }
 
+    last_exit_status = last_exit_code; // Sync exit code globally for heredocs
     return last_exit_code;
 }

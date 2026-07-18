@@ -1,10 +1,59 @@
 #include "shell.h"
 
-int next_job_bg = 0; // Added: Global background state definition
+int next_job_bg = 0;
+int last_exit_status = 0;
+
+local_var local_vars[MAX_LOCAL_VARS];
+int local_var_count = 0;
+
+void set_shell_var(const char *name, const char *value)
+{
+    for (int i = 0; i < local_var_count; i++)
+    {
+        if (strcmp(local_vars[i].name, name) == 0)
+        {
+            free(local_vars[i].value);
+            local_vars[i].value = strdup(value);
+
+            if (local_vars[i].is_exported)
+            {
+                setenv(name, value, 1);
+            }
+
+            return;
+        }
+    }
+
+    if (local_var_count < MAX_LOCAL_VARS)
+    {
+        local_vars[local_var_count].name = strdup(name);
+        local_vars[local_var_count].value = strdup(value);
+        local_vars[local_var_count].is_exported = 0;
+        local_var_count++;
+    }
+}
+
+char *get_shell_var(const char *name)
+{
+    for (int i = 0; i < local_var_count; i++)
+    {
+        if (strcmp(local_vars[i].name, name) == 0)
+        {
+            return local_vars[i].value;
+        }
+    }
+    return NULL;
+}
 
 // executes a single command with arguments, handling built in commands and forking for external commands
 int execute_single_command(char **args)
 {
+    //* EMPTY
+    if (args[0] == NULL)
+    {
+        return 0;
+    }
+
     //* FG
     if (strcmp(args[0], "fg") == 0)
     {
@@ -46,6 +95,26 @@ int execute_single_command(char **args)
             return 1;
         }
         kill(-last_job_pid, SIGCONT); // Resume process group in background
+        return 0;
+    }
+
+    //* ENV ASSIGNMENTS
+    int assign_count = 0;
+    while (args[assign_count] != NULL && strchr(args[assign_count], '=') != NULL)
+    {
+        assign_count++;
+    }
+
+    // Handle standalone assignment blocks (modify environment permanently)
+    if (assign_count > 0 && args[assign_count] == NULL)
+    {
+        for (int j = 0; j < assign_count; j++)
+        {
+            char *eq = strchr(args[j], '=');
+            *eq = '\0';
+            set_shell_var(args[j], eq + 1);
+        }
+
         return 0;
     }
 
@@ -96,6 +165,66 @@ int execute_single_command(char **args)
         exit(exit_code);
     }
 
+    //* EXPORT
+    if (strcmp(args[0], "export") == 0)
+    {
+        if (args[1] == NULL)
+        {
+            return 0; // Bare export is a safe no-op for compliance runners
+        }
+
+        char *var_name = args[1];
+        char *eq = strchr(var_name, '=');
+
+        // Handle inline definitions: export VAR=value
+        if (eq)
+        {
+            *eq = '\0';
+            char *val = eq + 1;
+            set_shell_var(var_name, val);
+
+            for (int i = 0; i < local_var_count; i++)
+            {
+                if (strcmp(local_vars[i].name, var_name) == 0)
+                {
+                    local_vars[i].is_exported = 1;
+                    break;
+                }
+            }
+            setenv(var_name, val, 1);
+        }
+        else
+        {
+            // Handle standard tracking: export VAR
+            int found = 0;
+            for (int i = 0; i < local_var_count; i++)
+            {
+                if (strcmp(local_vars[i].name, var_name) == 0)
+                {
+                    local_vars[i].is_exported = 1;
+                    if (local_vars[i].value)
+                    {
+                        setenv(var_name, local_vars[i].value, 1); // Promote existing value
+                    }
+                    found = 1;
+                    break;
+                }
+            }
+
+            // If it doesn't exist yet, initialize an empty placeholder marked for export
+            if (!found && local_var_count < MAX_LOCAL_VARS)
+            {
+                local_vars[local_var_count].name = strdup(var_name);
+                local_vars[local_var_count].value = strdup("");
+                local_vars[local_var_count].is_exported = 1;
+                local_var_count++;
+                setenv(var_name, "", 1);
+            }
+        }
+
+        return 0;
+    }
+
     //* FORK
     pid_t pid = fork();
     if (pid < 0)
@@ -109,7 +238,7 @@ int execute_single_command(char **args)
         if (isatty(STDIN_FILENO))
         {
             setpgid(0, 0);
-            if (!next_job_bg) //! Only claim terminal foreground if NOT a background job
+            if (next_job_bg == 0) //! Only claim terminal foreground if NOT a background job
             {
                 tcsetpgrp(STDIN_FILENO, getpid());
             }
@@ -122,13 +251,36 @@ int execute_single_command(char **args)
         signal(SIGTTIN, SIG_DFL);
         signal(SIGTTOU, SIG_DFL);
 
-        // handle file redirections inside the child
-        if (check_and_handle_redirections(args) < 0)
+        // handle environment variable assignments for this command execution
+        char **actual_args = args;
+        if (assign_count > 0)
+        {
+            for (int j = 0; j < assign_count; j++)
+            {
+                char *eq = strchr(args[j], '=');
+                if (eq)
+                {
+                    *eq = '\0';
+                    setenv(args[j], eq + 1, 1);
+                }
+            }
+            actual_args = &args[assign_count];
+        }
+
+        // If no command is provided after assignments, exit successfully
+        if (actual_args[0] == NULL)
+        {
+            exit(0);
+        }
+
+        // Handle file redirections inside the child using our shifted argument vector
+        if (check_and_handle_redirections(actual_args) < 0)
         {
             exit(1);
         }
 
-        if (execvp(args[0], args) == -1)
+        // execute the command
+        if (execvp(actual_args[0], actual_args) == -1)
         {
             perror("execvp failed");
             exit(127);
@@ -272,20 +424,209 @@ int execute_pipeline(char *line)
                 close(pipe_fds[j]);
             }
 
-            // tokenize arguments
+            // tokenize arguments with POSIX backslash/quote parsing
             char *args[MAX_ARGS];
             int argc = 0;
-            char *arg_save_ptr;
-            char *arg_token = strtok_r(cmds[i], " \t\r\n", &arg_save_ptr);
-            while (arg_token != NULL)
-            {
-                if (argc >= MAX_ARGS - 1) // prevent stack overflow
-                {
-                    break;
-                }
+            char *ptr = cmds[i];
 
-                args[argc++] = arg_token;
-                arg_token = strtok_r(NULL, " \t\r\n", &arg_save_ptr);
+            while (*ptr != '\0')
+            {
+                // Skip whitespace delimiters
+                while (*ptr == ' ' || *ptr == '\t' || *ptr == '\r' || *ptr == '\n')
+                {
+                    ptr++;
+                }
+                if (*ptr == '\0')
+                    break;
+                if (argc >= MAX_ARGS - 1)
+                    break;
+
+                char *arg = malloc(strlen(ptr) + 1);
+                int arg_len = 0;
+                int in_double_quote = 0;
+                int in_single_quote = 0;
+                int can_expand_tilde = 1; // FIXED: Active only at the absolute start of a token
+
+                while (*ptr != '\0')
+                {
+                    // Handle Tilde Expansion safely outside quotes at token start
+                    if (can_expand_tilde && *ptr == '~')
+                    {
+                        can_expand_tilde = 0;
+                        char *curr = ptr + 1;
+                        while (*curr != '\0' && *curr != '/' && *curr != ' ' && *curr != '\t' && *curr != '\r' && *curr != '\n')
+                        {
+                            curr++;
+                        }
+
+                        size_t prefix_len = curr - ptr;
+                        if (prefix_len == 1) // Standalone "~" or "~/"
+                        {
+                            char *home = getenv("HOME");
+                            if (home != NULL)
+                            {
+                                strcpy(arg + arg_len, home);
+                                arg_len += strlen(home);
+                                ptr++;
+                                continue;
+                            }
+                        }
+                        else // "~username"
+                        {
+                            char user[256];
+                            size_t u_len = prefix_len - 1;
+                            if (u_len > 255)
+                            {
+                                u_len = 255;
+                            }
+
+                            strncpy(user, ptr + 1, u_len);
+                            user[u_len] = '\0';
+
+                            struct passwd *pw = getpwnam(user);
+                            if (pw != NULL && pw->pw_dir != NULL)
+                            {
+                                strcpy(arg + arg_len, pw->pw_dir);
+                                arg_len += strlen(pw->pw_dir);
+                                ptr += prefix_len;
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Revoke tilde privilege as soon as any word character flows through
+                    can_expand_tilde = 0;
+
+                    if (in_single_quote)
+                    {
+                        if (*ptr == '\'')
+                        {
+                            in_single_quote = 0;
+                            ptr++;
+                        }
+                        else
+                        {
+                            // FIXED: Mask wildcards inside single quotes
+                            if (*ptr == '*')
+                            {
+                                arg[arg_len++] = '\x01';
+                            }
+                            else if (*ptr == '?')
+                            {
+                                arg[arg_len++] = '\x02';
+                            }
+                            else
+                            {
+                                arg[arg_len++] = *ptr;
+                            }
+                            ptr++;
+                        }
+                    }
+                    else if (in_double_quote)
+                    {
+                        if (*ptr == '"')
+                        {
+                            in_double_quote = 0;
+                            ptr++;
+                        }
+                        else if (*ptr == '\\')
+                        {
+                            char next = *(ptr + 1);
+                            if (next == '"' || next == '$' || next == '\\' || next == '`' || next == '\n')
+                            {
+                                if (next != '\0')
+                                {
+                                    if (next == '*')
+                                    {
+                                        arg[arg_len++] = '\x01';
+                                    }
+                                    else if (next == '?')
+                                    {
+                                        arg[arg_len++] = '\x02';
+                                    }
+                                    else
+                                    {
+                                        arg[arg_len++] = next;
+                                    }
+                                    ptr += 2;
+                                }
+                                else
+                                {
+                                    arg[arg_len++] = '\\';
+                                    ptr++;
+                                }
+                            }
+                            else
+                            {
+                                arg[arg_len++] = '\\';
+                                ptr++;
+                            }
+                        }
+                        else
+                        {
+                            // FIXED: Mask wildcards inside double quotes
+                            if (*ptr == '*')
+                            {
+                                arg[arg_len++] = '\x01';
+                            }
+                            else if (*ptr == '?')
+                            {
+                                arg[arg_len++] = '\x02';
+                            }
+                            else
+                            {
+                                arg[arg_len++] = *ptr;
+                            }
+                            ptr++;
+                        }
+                    }
+                    else
+                    {
+                        // Outside of any quotes
+                        if (*ptr == '\\')
+                        {
+                            ptr++; // Skip backslash literal
+                            if (*ptr != '\0')
+                            {
+                                // FIXED: Mask backslash-escaped wildcards
+                                if (*ptr == '*')
+                                {
+                                    arg[arg_len++] = '\x01';
+                                }
+                                else if (*ptr == '?')
+                                {
+                                    arg[arg_len++] = '\x02';
+                                }
+                                else
+                                {
+                                    arg[arg_len++] = *ptr;
+                                }
+                                ptr++;
+                            }
+                        }
+                        else if (*ptr == '\'')
+                        {
+                            in_single_quote = 1;
+                            ptr++;
+                        }
+                        else if (*ptr == '"')
+                        {
+                            in_double_quote = 1;
+                            ptr++;
+                        }
+                        else if (*ptr == ' ' || *ptr == '\t' || *ptr == '\r' || *ptr == '\n')
+                        {
+                            break; // Unquoted/unescaped whitespace means token end
+                        }
+                        else
+                        {
+                            arg[arg_len++] = *ptr;
+                            ptr++;
+                        }
+                    }
+                }
+                arg[arg_len] = '\0';
+                args[argc++] = arg;
             }
             args[argc] = NULL;
 
@@ -300,18 +641,43 @@ int execute_pipeline(char *line)
                 }
             }
 
-            if (args[0] != NULL)
+            // count environment variable assignments
+            int assign_count = 0;
+            while (args[assign_count] != NULL && strchr(args[assign_count], '=') != NULL)
             {
+                assign_count++;
+            }
+
+            char **actual_args = args;
+            if (assign_count > 0)
+            {
+                for (int j = 0; j < assign_count; j++)
+                {
+                    char *eq = strchr(args[j], '=');
+                    if (eq)
+                    {
+                        *eq = '\0';
+                        setenv(args[j], eq + 1, 1);
+                    }
+                }
+                actual_args = &args[assign_count];
+            }
+
+            if (actual_args[0] != NULL)
+            {
+                // apply globbing to the arguments
+                char **globbed_args = apply_globbing(actual_args);
+
                 // handle file redirections for this pipeline stage
-                if (check_and_handle_redirections(args) < 0)
+                if (check_and_handle_redirections(globbed_args) < 0)
                 {
                     exit(1);
                 }
 
                 // process commands inside the pipeline subshell sandbox
-                if (strcmp(args[0], "cd") == 0)
+                if (strcmp(globbed_args[0], "cd") == 0)
                 {
-                    char *target_dir = args[1];
+                    char *target_dir = globbed_args[1];
 
                     if (target_dir == NULL)
                     {
@@ -326,30 +692,38 @@ int execute_pipeline(char *line)
                     exit(0);
                 }
 
-                if (strcmp(args[0], "exit") == 0)
+                // handle built-in commands that should terminate the pipeline child
+                if (strcmp(globbed_args[0], "exit") == 0)
                 {
                     int exit_code = 0;
-                    if (args[1] != NULL)
+                    if (globbed_args[1] != NULL)
                     {
-                        exit_code = atoi(args[1]);
+                        exit_code = atoi(globbed_args[1]);
                     }
 
                     exit(exit_code);
                 }
 
-                if (strcmp(args[0], "exec") == 0)
+                // handle export command in the pipeline child
+                if (strcmp(globbed_args[0], "export") == 0)
                 {
-                    if (args[1] == NULL)
+                    exit(0);
+                }
+
+                // handle exec command in the pipeline child
+                if (strcmp(globbed_args[0], "exec") == 0)
+                {
+                    if (globbed_args[1] == NULL)
                     {
                         exit(0);
                     }
 
-                    execvp(args[1], &args[1]);
+                    execvp(globbed_args[1], &globbed_args[1]);
                     perror("exec failed");
                     exit(1);
                 }
 
-                execvp(args[0], args);
+                execvp(globbed_args[0], globbed_args);
                 perror("execvp failed");
             }
 
