@@ -32,86 +32,107 @@ int main()
         pid_t shell_pgid = getpid();
         setpgid(shell_pgid, shell_pgid);
         tcsetpgrp(shell_terminal, shell_pgid);
-    }
 
-    char *buffer = NULL;
-    size_t buffer_size = 0;
-    ssize_t characters_read;
+        // Initialize custom Readline completion hooks
+        init_completion();
+    }
 
     while (1)
     {
-        printf("$ ");
-        fflush(stdout);
-
         char *complete_line = NULL;
         size_t complete_alloc = 0;
         int keep_reading = 1;
+        const char *prompt = "$ ";
 
         while (keep_reading)
         {
-            characters_read = getline(&buffer, &buffer_size, stdin);
-            if (characters_read == -1)
+            char *line = NULL;
+
+            if (isatty(STDIN_FILENO))
             {
+                line = readline(prompt);
+            }
+            else
+            {
+                char *buf = NULL;
+                size_t buf_size = 0;
+                ssize_t read_bytes = getline(&buf, &buf_size, stdin);
+                if (read_bytes != -1)
+                {
+                    line = buf;
+                    size_t l = strlen(line);
+                    while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r'))
+                    {
+                        line[l - 1] = '\0';
+                        l--;
+                    }
+                }
+                else
+                {
+                    free(buf);
+                    line = NULL;
+                }
+            }
+
+            if (line == NULL)
+            {
+                keep_reading = 0;
                 break;
             }
 
-            // strip trailing newlines
-            size_t len = strlen(buffer);
-            while (len > 0 && (buffer[len - 1] == '\n' || buffer[len - 1] == '\r'))
-            {
-                buffer[len - 1] = '\0';
-                len--;
-            }
-
-            // check if line ends with a backslash
+            // Strip trailing continuation backslash
+            size_t len = strlen(line);
             int has_backslash = 0;
-            if (len > 0 && buffer[len - 1] == '\\')
+            if (len > 0 && line[len - 1] == '\\')
             {
                 has_backslash = 1;
-                buffer[len - 1] = '\0'; // drpo the backslash
+                line[len - 1] = '\0';
                 len--;
             }
 
-            // dynamically grow the command string
             if (complete_line == NULL)
             {
                 complete_alloc = len + 1;
                 complete_line = malloc(complete_alloc);
-                strcpy(complete_line, buffer);
+                strcpy(complete_line, line);
             }
             else
             {
                 size_t old_len = strlen(complete_line);
                 complete_alloc = old_len + len + 1;
                 complete_line = realloc(complete_line, complete_alloc);
-                strcat(complete_line, buffer);
+                strcat(complete_line, line);
             }
 
-            if (!has_backslash)
+            free(line);
+
+            if (has_backslash)
+            {
+                prompt = "> ";
+            }
+            else
             {
                 keep_reading = 0;
             }
         }
 
-        // handle exit on EOF (ctrl+D)
-        if (characters_read == -1 && (complete_line == NULL || strlen(complete_line) == 0))
+        // Handle exit on EOF (Ctrl+D)
+        if (complete_line == NULL)
         {
-            if (complete_line)
-            {
-                free(complete_line);
-            }
-
             break;
         }
 
-        // send the reassembled multi line command
-        if (complete_line != NULL)
+        if (strlen(complete_line) > 0)
         {
+            if (isatty(STDIN_FILENO))
+            {
+                add_history(complete_line);
+            }
             execute_command_line(complete_line);
-            free(complete_line);
         }
+
+        free(complete_line);
     }
 
-    free(buffer);
     return 0;
 }

@@ -13,6 +13,10 @@
 #include <stdbool.h>
 #include <glob.h>
 #include <pwd.h>
+#include <readline/readline.h>
+#include <readline/history.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #define MAX_ARGS 1024
 #define MAX_CMDS 1024
@@ -40,5 +44,6 @@ char *expand_environment_variables(char *src, int last_exit_code);
 void set_shell_var(const char *name, const char *value);
 char *get_shell_var(const char *name);
 char **apply_globbing(char **args);
+void init_completion(void);
 
 #endif

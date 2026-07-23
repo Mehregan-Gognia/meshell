@@ -20,7 +20,6 @@ int check_and_handle_redirections(char **args)
         // check for an explicit file descriptor prefix (0-9)
         if (token[0] >= '0' && token[0] <= '9')
         {
-            // ensure the digit is immediately followed by a redirection operator
             if (token[1] == '>' || token[1] == '<')
             {
                 explicit_fd = token[0] - '0';
@@ -30,7 +29,6 @@ int check_and_handle_redirections(char **args)
 
         int operator_len = 0;
 
-        // Identify the operator relative to our adjusted pointer position
         if (strncmp(operator_ptr, ">>", 2) == 0)
         {
             operator_len = 2;
@@ -75,13 +73,11 @@ int check_and_handle_redirections(char **args)
             fd_to_replace = (explicit_fd != -1) ? explicit_fd : STDIN_FILENO;
         }
 
-        // Process the redirection if an operator was matched
         if (fd_to_replace != -1)
         {
             char *filename = NULL;
             int shift_count = 0;
 
-            // track whether the filename is attached or standalone
             if (operator_ptr[operator_len] != '\0')
             {
                 filename = operator_ptr + operator_len;
@@ -107,7 +103,6 @@ int check_and_handle_redirections(char **args)
                 }
                 else
                 {
-                    // Validate that the filename is actually a digit before parsing
                     int is_digit = 1;
                     for (int k = 0; filename[k] != '\0'; k++)
                     {
@@ -131,23 +126,9 @@ int check_and_handle_redirections(char **args)
                     }
                 }
             }
-            else if (is_heredoc) // FIXED: Process Heredoc streams streamingly
+            else if (is_heredoc)
             {
-                int orig_stdin = dup(STDIN_FILENO);
-                if (orig_stdin < 0)
-                {
-                    perror("dup stdin failed");
-                    return -1;
-                }
-                FILE *heredoc_input = fdopen(orig_stdin, "r");
-                if (!heredoc_input)
-                {
-                    perror("fdopen stdin failed");
-                    close(orig_stdin);
-                    return -1;
-                }
-
-                // Strip quotes from delimiter if present, and disable expansion if quoted
+                // Strip quotes from delimiter if present; disable expansion if quoted
                 int expand = 1;
                 char clean_delim[256];
                 int d_idx = 0;
@@ -169,7 +150,6 @@ int check_and_handle_redirections(char **args)
                 if (pipe(heredoc_pipe) < 0)
                 {
                     perror("heredoc pipe failed");
-                    fclose(heredoc_input);
                     return -1;
                 }
 
@@ -177,8 +157,30 @@ int check_and_handle_redirections(char **args)
                 size_t line_cap = 0;
                 ssize_t line_len;
 
-                while ((line_len = getline(&line_buf, &line_cap, heredoc_input)) != -1)
+                while (1)
                 {
+                    if (isatty(STDIN_FILENO))
+                    {
+                        char *rl = readline("> ");
+                        if (!rl)
+                            break;
+                        line_len = strlen(rl);
+                        line_buf = realloc(line_buf, line_len + 2);
+                        strcpy(line_buf, rl);
+                        line_buf[line_len] = '\n';
+                        line_buf[line_len + 1] = '\0';
+                        line_len++;
+                        free(rl);
+                    }
+                    else
+                    {
+                        // Use getline on stdin to consume from the same buffer as main.c
+                        line_len = getline(&line_buf, &line_cap, stdin);
+                        if (line_len == -1)
+                            break;
+                    }
+
+                    // Strip newlines to cleanly check for the EOF delimiter match
                     char *chk = strdup(line_buf);
                     size_t clen = strlen(chk);
                     while (clen > 0 && (chk[clen - 1] == '\n' || chk[clen - 1] == '\r'))
@@ -206,7 +208,6 @@ int check_and_handle_redirections(char **args)
                     }
                 }
                 free(line_buf);
-                fclose(heredoc_input);
                 close(heredoc_pipe[1]);
 
                 dup2(heredoc_pipe[0], fd_to_replace);
@@ -230,7 +231,6 @@ int check_and_handle_redirections(char **args)
                     return -1;
                 }
 
-                // Duplicate the file descriptor to the target and close the original
                 if (fd != fd_to_replace)
                 {
                     dup2(fd, fd_to_replace);
@@ -238,7 +238,7 @@ int check_and_handle_redirections(char **args)
                 }
             }
 
-            // shift argument vector left to completely erase the redirection tokens
+            // shift argument vector left to erase redirection tokens
             int j = i;
             while (args[j + shift_count] != NULL)
             {
